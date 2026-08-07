@@ -1,5 +1,5 @@
 const payments = require('../services/payments');
-const WebhookEvent = require('../models/WebhookEvent');
+const db = require('../db');
 const bookingService = require('../services/bookingService');
 const logger = require('../utils/logger');
 
@@ -21,14 +21,12 @@ async function handle(req, res) {
     return res.status(400).json({ error: 'Invalid signature' });
   }
 
-  try {
-    await WebhookEvent.create({ eventId: event.id, type: event.type });
-  } catch (err) {
-    if (err.code === 11000) {
-      logger.debug('Duplicate webhook ignored', { eventId: event.id });
-      return res.json({ received: true, duplicate: true });
-    }
-    throw err;
+  // The adapter turns "already recorded" into `false` rather than an engine
+  // specific duplicate-key error, so this branch is identical on both engines.
+  const isNew = await db.webhookEvents.recordIfNew({ eventId: event.id, type: event.type });
+  if (!isNew) {
+    logger.debug('Duplicate webhook ignored', { eventId: event.id });
+    return res.json({ received: true, duplicate: true });
   }
 
   if (event.type === 'payment_intent.succeeded') {

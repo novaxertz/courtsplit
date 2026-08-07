@@ -1,7 +1,20 @@
-const Booking = require('../models/Booking');
-const { BOOKING_STATUS, SHARE_STATUS } = require('../models/Booking');
-const Court = require('../models/Court');
-const User = require('../models/User');
+/**
+ * Booking domain logic.
+ *
+ * Persistence is reached only through the repository in `src/db`, which is
+ * selected by `DB_ENGINE`. Nothing below knows whether it is talking to
+ * MongoDB or PostgreSQL: no model imports, no driver error codes, no query
+ * syntax. That is what lets the same concurrency suite run on both engines.
+ *
+ * The concurrency design is unchanged from the document-only version. Every
+ * state transition is still expressed as a conditional write that either
+ * matches and applies, or matches nothing and is a no-op. Whether that
+ * conditionality is enforced by a Mongo query filter or a SQL WHERE clause
+ * plus a row lock is the adapter's problem, not this file's.
+ */
+const db = require('../db');
+const { SlotTakenError } = require('../db/errors');
+const { BOOKING_STATUS, SHARE_STATUS } = require('../domain/status');
 const payments = require('./payments');
 const config = require('../config/env');
 const ApiError = require('../utils/ApiError');
@@ -9,8 +22,8 @@ const logger = require('../utils/logger');
 const { splitAmount, percentageOf } = require('../utils/money');
 
 async function resolveParticipants(emails) {
-  const users = await User.find({ email: { $in: emails } });
-  const byEmail = new Map(users.map((u) => [u.email, u]));
+  const found = await db.users.findByEmails(emails);
+  const byEmail = new Map(found.map((u) => [u.email, u]));
   const missing = emails.filter((e) => !byEmail.has(e));
   if (missing.length) {
     throw ApiError.badRequest('Some participants are not registered', { missing });
@@ -22,12 +35,14 @@ async function resolveParticipants(emails) {
  * Creates a booking and one payment intent per participant.
  *
  * The slot is claimed immediately in PENDING_PAYMENT state so nobody else can
- * take it while the group pays. A unique partial index on (court, slotStart)
- * makes that claim atomic: if two groups submit simultaneously, the database
- * rejects the second rather than both appearing to succeed.
+ * take it while the group pays. A partial unique constraint on
+ * (court, slotStart) makes that claim atomic: if two groups submit
+ * simultaneously the database rejects the second rather than both appearing to
+ * succeed. The adapter raises SlotTakenError for whichever driver error its
+ * engine produced.
  */
 async function createBooking({ courtId, organiserId, slotStart, participantEmails }) {
-  const court = await Court.findById(courtId);
+  const court = await db.courts.findById(courtId);
   if (!court || !court.active) {
     throw ApiError.notFound('Court not found');
   }
@@ -40,7 +55,7 @@ async function createBooking({ courtId, organiserId, slotStart, participantEmail
     throw ApiError.badRequest('Cannot book a slot in the past');
   }
 
-  const organiser = await User.findById(organiserId);
+  const organiser = await db.users.findById(organiserId);
   if (!organiser) throw ApiError.notFound('Organiser not found');
 
   const emails = [...new Set([organiser.email, ...participantEmails.map((e) => e.toLowerCase())])];
@@ -55,91 +70,74 @@ async function createBooking({ courtId, organiserId, slotStart, participantEmail
 
   const end = new Date(start.getTime() + 60 * 60 * 1000);
   const fundingDeadline = new Date(
-    Math.min(
-      Date.now() + config.booking.fundingWindowMinutes * 60 * 1000,
-      start.getTime()
-    )
+    Math.min(Date.now() + config.booking.fundingWindowMinutes * 60 * 1000, start.getTime())
   );
 
   let booking;
   try {
-    booking = await Booking.create({
-      court: court._id,
-      organiser: organiser._id,
+    booking = await db.bookings.create({
+      courtId: court.id,
+      organiserId: organiser.id,
       slotStart: start,
       slotEnd: end,
       totalAmount: court.pricePerSlot,
       currency: court.currency,
-      status: BOOKING_STATUS.PENDING_PAYMENT,
       fundingDeadline,
       shares: participants.map((user, i) => ({
-        user: user._id,
+        userId: user.id,
         email: user.email,
         amount: amounts[i]
       }))
     });
   } catch (err) {
-    // 11000 is MongoDB's duplicate key error - the slot was claimed first.
-    if (err.code === 11000) {
+    if (err instanceof SlotTakenError) {
       throw ApiError.conflict('That slot has already been booked');
     }
     throw err;
   }
 
   // One intent per share, so each participant pays only their own portion.
-  await Promise.all(
+  const refs = await Promise.all(
     booking.shares.map(async (share) => {
       const intent = await payments.createPaymentIntent({
         amount: share.amount,
         currency: booking.currency,
-        metadata: { bookingId: booking.id, shareId: share._id.toString() },
-        idempotencyKey: `booking_${booking.id}_share_${share._id}`
+        metadata: { bookingId: booking.id, shareId: share.id },
+        idempotencyKey: `booking_${booking.id}_share_${share.id}`
       });
-      share.paymentRef = intent.id;
+      return { shareId: share.id, paymentRef: intent.id };
     })
   );
-  await booking.save();
+  const withRefs = await db.bookings.attachPaymentRefs(booking.id, refs);
 
   logger.info('Booking created', { bookingId: booking.id, shares: booking.shares.length });
-  return booking;
+  return withRefs || booking;
 }
 
 /**
  * Marks one share paid and confirms the booking once every share has settled.
  *
- * The update is expressed as a single conditional write matching the share's
- * pending state. A duplicate webhook therefore matches nothing on its second
- * delivery and changes no state, which keeps the operation idempotent without
- * needing a lock.
+ * The settlement is a single conditional write matching both the booking's
+ * open state and the share's pending state. A duplicate webhook therefore
+ * matches nothing on its second delivery and changes nothing, which keeps the
+ * operation idempotent without an application-level lock.
  */
 async function markSharePaid({ bookingId, shareId }) {
-  const updated = await Booking.findOneAndUpdate(
-    {
-      _id: bookingId,
-      status: BOOKING_STATUS.PENDING_PAYMENT,
-      shares: { $elemMatch: { _id: shareId, status: SHARE_STATUS.PENDING } }
-    },
-    {
-      $set: {
-        'shares.$.status': SHARE_STATUS.PAID,
-        'shares.$.paidAt': new Date()
-      }
-    },
-    { new: true }
-  );
+  const updated = await db.bookings.markSharePaidIfPending({
+    bookingId,
+    shareId,
+    at: new Date()
+  });
 
   if (!updated) {
     logger.debug('Share already settled or booking no longer pending', { bookingId, shareId });
-    return Booking.findById(bookingId);
+    return db.bookings.findById(bookingId);
   }
 
   if (updated.shares.every((s) => s.status === SHARE_STATUS.PAID)) {
-    // Guarded again on status so a concurrent expiry cannot be overwritten.
-    const confirmed = await Booking.findOneAndUpdate(
-      { _id: updated._id, status: BOOKING_STATUS.PENDING_PAYMENT },
-      { $set: { status: BOOKING_STATUS.CONFIRMED, confirmedAt: new Date() } },
-      { new: true }
-    );
+    // Guarded again on the open state so a concurrent expiry cannot be
+    // overwritten. Null means expiry won the race; the booking stays expired.
+    const confirmed = await db.bookings.confirmIfPending(updated.id, new Date());
     if (confirmed) {
       logger.info('Booking fully funded and confirmed', { bookingId: confirmed.id });
       return confirmed;
@@ -149,8 +147,18 @@ async function markSharePaid({ bookingId, shareId }) {
   return updated;
 }
 
-async function refundShares(booking, percent = 100) {
+/**
+ * Issues refunds for every paid share and records them.
+ *
+ * Returns the refreshed booking. The provider calls happen before the database
+ * writes so a failed refund does not leave a share marked refunded that never
+ * was; the idempotency key makes a retry safe.
+ */
+async function refundPaidShares(booking, percent = 100) {
   const paid = booking.shares.filter((s) => s.status === SHARE_STATUS.PAID);
+  if (!paid.length) return booking;
+
+  const refunds = [];
   await Promise.all(
     paid.map(async (share) => {
       const amount = percentageOf(share.amount, percent);
@@ -158,39 +166,34 @@ async function refundShares(booking, percent = 100) {
       await payments.refund({
         paymentRef: share.paymentRef,
         amount,
-        idempotencyKey: `refund_${booking.id}_${share._id}`
+        idempotencyKey: `refund_${booking.id}_${share.id}`
       });
-      share.status = SHARE_STATUS.REFUNDED;
-      share.refundedAt = new Date();
-      share.refundAmount = amount;
+      refunds.push({ shareId: share.id, amount, at: new Date() });
     })
   );
-  return booking;
+
+  if (!refunds.length) return booking;
+  return (await db.bookings.applyRefunds(booking.id, refunds)) || booking;
 }
 
 /**
  * Expires bookings that were not fully funded before their deadline and
- * refunds whoever had already paid. Written as a conditional transition so it
- * is safe to run on a schedule and on more than one instance at once.
+ * refunds whoever had already paid. The claim is a conditional transition, so
+ * this is safe to run on a schedule and on more than one instance at once -
+ * losers of the race simply skip the booking.
  */
 async function expireUnfundedBookings(now = new Date()) {
-  const candidates = await Booking.find({
-    status: BOOKING_STATUS.PENDING_PAYMENT,
-    fundingDeadline: { $lte: now }
-  });
+  const candidateIds = await db.bookings.findExpiryCandidateIds(now);
 
   const expired = [];
-  for (const candidate of candidates) {
-    const claimed = await Booking.findOneAndUpdate(
-      { _id: candidate._id, status: BOOKING_STATUS.PENDING_PAYMENT },
-      { $set: { status: BOOKING_STATUS.EXPIRED, expiredAt: now } },
-      { new: true }
-    );
+  for (const candidateId of candidateIds) {
+    // eslint-disable-next-line no-await-in-loop
+    const claimed = await db.bookings.claimExpiredIfPending(candidateId, now);
     if (!claimed) continue; // another worker got there first
 
-    await refundShares(claimed, 100);
-    await claimed.save();
-    expired.push(claimed);
+    // eslint-disable-next-line no-await-in-loop
+    const settled = await refundPaidShares(claimed, 100);
+    expired.push(settled);
     logger.info('Booking expired and refunded', { bookingId: claimed.id });
   }
   return expired;
@@ -201,33 +204,34 @@ async function expireUnfundedBookings(now = new Date()) {
  * mirroring how venues actually price late cancellations.
  */
 async function cancelBooking({ bookingId, userId }) {
-  const booking = await Booking.findById(bookingId);
+  const booking = await db.bookings.findById(bookingId);
   if (!booking) throw ApiError.notFound('Booking not found');
-  if (booking.organiser.toString() !== userId) {
+  if (String(booking.organiserId) !== String(userId)) {
     throw ApiError.forbidden('Only the organiser can cancel this booking');
   }
   if ([BOOKING_STATUS.CANCELLED, BOOKING_STATUS.EXPIRED].includes(booking.status)) {
     throw ApiError.conflict(`Booking is already ${booking.status.toLowerCase()}`);
   }
 
-  const hoursUntilStart = (booking.slotStart.getTime() - Date.now()) / (1000 * 60 * 60);
+  const hoursUntilStart =
+    (new Date(booking.slotStart).getTime() - Date.now()) / (1000 * 60 * 60);
   const percent =
     hoursUntilStart >= config.booking.freeCancellationHours
       ? 100
       : config.booking.lateCancellationRefundPercent;
 
-  const claimed = await Booking.findOneAndUpdate(
-    { _id: booking._id, status: booking.status },
-    { $set: { status: BOOKING_STATUS.CANCELLED, cancelledAt: new Date() } },
-    { new: true }
-  );
+  const claimed = await db.bookings.claimTransition({
+    bookingId: booking.id,
+    from: booking.status,
+    to: BOOKING_STATUS.CANCELLED,
+    at: new Date()
+  });
   if (!claimed) throw ApiError.conflict('Booking changed while cancelling, retry');
 
-  await refundShares(claimed, percent);
-  await claimed.save();
+  const settled = await refundPaidShares(claimed, percent);
 
   logger.info('Booking cancelled', { bookingId: claimed.id, refundPercent: percent });
-  return { booking: claimed, refundPercent: percent };
+  return { booking: settled, refundPercent: percent };
 }
 
 module.exports = {
