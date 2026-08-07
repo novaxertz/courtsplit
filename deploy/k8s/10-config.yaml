@@ -1,0 +1,40 @@
+# Non-secret configuration.
+#
+# Split from the Secret on purpose: a ConfigMap is readable by anyone with get
+# access to the namespace and shows up in plain text in `kubectl describe`, so
+# nothing sensitive belongs here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: courtsplit-config
+  namespace: courtsplit
+data:
+  NODE_ENV: "production"
+  PORT: "4000"
+  DB_ENGINE: "mongo"
+  # In-cluster DNS: <service>.<namespace>.svc.cluster.local. The short form
+  # works from the same namespace, but the fully-qualified name avoids
+  # surprises if the search-domain configuration ever changes.
+  MONGO_URI: "mongodb://courtsplit-mongo.courtsplit.svc.cluster.local:27017/courtsplit"
+  PAYMENT_PROVIDER: "mock"
+  LOG_LEVEL: "info"
+  FUNDING_WINDOW_MINUTES: "60"
+  # The CronJob owns the expiry sweep in this cluster, so the API must not also
+  # run its own interval - two replicas would otherwise mean two schedulers.
+  EXPIRY_SWEEP_IN_PROCESS: "false"
+---
+# Secrets.
+#
+# NOTE, honestly: a base64 `stringData` block in a git-tracked file is NOT
+# secret management. Kubernetes Secrets are only base64-encoded, not encrypted,
+# and this value is committed. It is acceptable for a local kind cluster and
+# nothing else. A real deployment uses Sealed Secrets, External Secrets with a
+# cloud secret manager, or SOPS-encrypted manifests.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: courtsplit-secrets
+  namespace: courtsplit
+type: Opaque
+stringData:
+  JWT_SECRET: "dev-only-not-a-real-secret"

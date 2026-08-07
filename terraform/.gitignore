@@ -1,0 +1,24 @@
+# Provider binaries and lock metadata directories.
+.terraform/
+
+# State must never be committed. It lives in the remote backend, and it holds
+# every attribute Terraform read - including values marked sensitive.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Variable files frequently carry credentials or environment specifics.
+*.tfvars
+*.tfvars.json
+!example.tfvars
+
+# Crash logs can contain state fragments.
+crash.log
+crash.*.log
+
+# Kubeconfig written by the kind provider. Contains the cluster CA plus the
+# admin client certificate and private key - never commit it.
+*-config
+kubeconfig
+kubeconfig-*
+*.kubeconfig

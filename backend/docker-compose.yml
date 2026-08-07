@@ -1,14 +1,63 @@
-# PostgreSQL for the relational adapter and its test runs.
+# Local stack: the API plus both databases.
 #
-# Port 5433 on the host deliberately, so a local PostgreSQL already listening on
-# 5432 is not shadowed. The container still uses 5432 internally.
+#   docker compose up -d --build     API + MongoDB + PostgreSQL
+#   docker compose logs -f api
+#
+# MongoDB backs the running API. PostgreSQL is here for the relational adapter
+# and `npm run test:both`; the API only talks to it when DB_ENGINE=postgres.
+
 services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: courtsplit-api:local
+    container_name: courtsplit-api
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      DB_ENGINE: mongo
+      # Service name as hostname - compose puts every service on one network
+      # with DNS, so "mongo" resolves to the database container.
+      MONGO_URI: mongodb://mongo:27017/courtsplit
+      POSTGRES_URL: postgres://postgres:dev@postgres:5432/courtsplit
+      # Development value only. In Kubernetes this comes from a Secret, and in
+      # production from a real secret manager - never from a compose file.
+      JWT_SECRET: dev-only-not-a-real-secret
+      PAYMENT_PROVIDER: mock
+      LOG_LEVEL: info
+    ports:
+      - "4000:4000"
+    depends_on:
+      mongo:
+        # Waits for the healthcheck to pass, not merely for the container to
+        # exist. Without `condition: service_healthy` the API would start
+        # racing a database that has not finished initialising.
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    container_name: courtsplit-mongo
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     container_name: courtsplit-pg
     environment:
       POSTGRES_PASSWORD: dev
       POSTGRES_DB: courtsplit
+    # 5433 on the host so a local PostgreSQL on 5432 is not shadowed.
     ports:
       - "5433:5432"
     healthcheck:
@@ -16,6 +65,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    # No named volume: this database is for development and tests, and the
-    # schema is reapplied on every test start. Persisting it would only make
-    # stale state harder to notice.
+    restart: unless-stopped
+
+volumes:
+  mongo-data:

@@ -136,7 +136,8 @@ The test suite asserts this invariant across hundreds of total/participant combi
 ### Expiry is safe to run anywhere
 
 The sweep claims each booking with a conditional transition before refunding, so running it more
-often than needed — or on several instances at once — cannot refund anyone twice.
+often than needed — or on several instances at once — cannot refund anyone twice. It runs as a
+Kubernetes CronJob in the deployed setup; see [Kubernetes](#kubernetes).
 
 ---
 
@@ -177,8 +178,108 @@ Scan the QR code with Expo Go, or press `w` for the browser. On a physical devic
 
 ```bash
 cd backend
-npm test
+npm test              # against MongoDB (in-memory, no Docker needed)
+npm run test:both     # the same suite against MongoDB and PostgreSQL in turn
 ```
+
+---
+
+## Running it in containers
+
+```bash
+cd backend
+docker compose up -d --build
+curl http://localhost:4000/readyz     # {"status":"ready","engine":"mongo"}
+```
+
+Brings up the API, MongoDB, and a PostgreSQL instance for the relational adapter.
+
+The image is multi-stage: the build stage compiles `bcrypt` with a C toolchain that never
+reaches the runtime layer. It runs as the unprivileged `node` user with `dumb-init` as PID 1,
+so `SIGTERM` is forwarded rather than swallowed — without an init process Kubernetes waits out
+the full termination grace period on every rollout.
+
+### Two health endpoints, not one
+
+| Endpoint | Checks | Failing it means |
+|---|---|---|
+| `/livez` | process is alive; **no** external dependencies | restart the container |
+| `/readyz` | database answers a real command, bounded to 2s | stop sending traffic, don't restart |
+
+The distinction is load-bearing. Liveness must not touch the database: a failing liveness probe
+kills the container, so a brief database blip would restart every replica simultaneously and turn
+a recoverable dependency outage into a real one. Readiness must touch it, because a pod that
+cannot reach storage should leave the load balancer and rejoin when it recovers.
+
+The readiness ping is bounded deliberately. With MongoDB down, the driver waits out its full
+30-second server-selection window, so an unbounded check *hangs* instead of answering — measured
+here before the timeout was added. It now returns `503` in ~2s.
+
+Liveness is at `/livez`, not `/healthz`, because ingress-nginx defines its own `/healthz` in the
+default server block and answers it directly — through the ingress you get an empty `text/html`
+200 from nginx, never the app. Kubelet probes hit the pod IP and were unaffected, which is what
+made it easy to miss.
+
+---
+
+## Kubernetes
+
+```bash
+cd terraform
+docker compose -f bootstrap/docker-compose.yml up -d      # MinIO, the state backend
+$env:AWS_ACCESS_KEY_ID = "courtsplit"
+$env:AWS_SECRET_ACCESS_KEY = "courtsplit-dev-secret"
+terraform init && terraform apply                          # kind cluster + ingress + metrics
+
+cd ../backend && docker build -t courtsplit-api:local .
+kind load docker-image courtsplit-api:local --name courtsplit
+kubectl --context kind-courtsplit apply -f ../deploy/k8s/
+
+curl http://localhost:8080/readyz
+```
+
+`deploy/k8s/` holds a namespace, ConfigMap and Secret, a MongoDB StatefulSet with a PVC, the API
+Deployment (2 replicas, HPA to 6), an Ingress, and the expiry CronJob.
+
+**MongoDB is a StatefulSet, not a Deployment.** Deployments assume interchangeable stateless
+replicas; a database needs stable identity and a volume that survives rescheduling.
+
+**Rollouts use `maxUnavailable: 0`.** Combined with a readiness probe that checks something real,
+a broken image cannot take the service down — the new pod never becomes ready, the old one is
+never removed, and the rollout stalls instead of failing open.
+
+**Expect a few API restarts on the very first deploy to a fresh cluster.** The startup connect
+retries with backoff over roughly 20 seconds, which covers DNS propagation but not the ~4 minutes
+kubelet needs to pull `mongo:7` the first time. The pods crash, restart, and converge once the
+database is up; subsequent deploys hit a warm image cache and start clean.
+
+### The expiry sweep is now a CronJob
+
+Previously the sweep ran as a `setInterval` inside the API process — listed in this README's own
+limitations as "no dedicated task scheduler". That was survivable at one replica. At two it meant
+two schedulers competing over the same bookings: harmless, because every transition is a
+conditional write, but duplicated work owned by nobody.
+
+It now runs as a Kubernetes CronJob (`scripts/expiry-sweep.js`), so there is exactly one runner
+and the API is genuinely stateless. Correctness still does not depend on that: the transitions
+match on the booking still being `PENDING_PAYMENT`, so overlapping runs change nothing twice.
+`concurrencyPolicy: Forbid` is belt-and-braces on top, not a substitute.
+
+---
+
+## Terraform
+
+`terraform/` provisions the cluster, ingress-nginx, and metrics-server, with **remote state** on
+an S3-compatible backend (MinIO locally, via `terraform/bootstrap/`). State uses `use_lockfile`
+for native S3 locking — no DynamoDB table — and the bucket has versioning enabled.
+
+Terraform owns the *platform*; the application manifests stay in `deploy/k8s` and are applied
+with kubectl. That split is deliberate: re-expressing Deployments as HCL duplicates them in a
+second dialect, and `kubernetes_manifest` needs the cluster to exist at plan time, which is
+impossible when the same run creates it.
+
+Pointing the backend at real AWS S3 means deleting the `endpoints`, `use_path_style` and `skip_*`
+flags in `backend.tf` and setting a real region. Nothing else changes.
 
 ---
 
@@ -197,7 +298,9 @@ npm test
 | `GET` | `/bookings/:id` | ✔ | One booking with share breakdown |
 | `POST` | `/bookings/:id/cancel` | ✔ | Cancel and refund per policy |
 | `POST` | `/webhooks/payments` | signature | Payment provider callback |
-| `GET` | `/health` | – | Liveness check |
+| `GET` | `/livez` | – | Liveness — process only, no dependencies |
+| `GET` | `/readyz` | – | Readiness — verifies the database answers |
+| `GET` | `/health` | – | Legacy alias for `/livez` |
 
 ### Example
 
@@ -237,16 +340,32 @@ backend/
   src/
     app.js                   express wiring and middleware order
     config/                  environment loading, database connection
-    models/                  User, Court, Booking, WebhookEvent
+    domain/status.js         booking/share status vocabulary, engine-neutral
+    db/
+      index.js               selects the adapter from DB_ENGINE
+      mongo/repository.js    Mongoose behind the repository contract
+      postgres/              schema.sql, connection pool, SQL adapter
+    models/                  User, Court, Booking, WebhookEvent (Mongoose)
     controllers/             request/response handling
     services/
       bookingService.js      the domain logic - splitting, funding, expiry, refunds
       payments/              provider interface + stripe and mock implementations
     middleware/              auth, error handling
-    jobs/                    scheduled expiry sweep
+    jobs/                    in-process expiry sweep (opt-out under Kubernetes)
     utils/                   money maths, errors, logging
-  tests/                     money invariants, payment provider behaviour
-  scripts/seed.js            demo data
+  tests/                     money, payment provider, cross-engine concurrency
+  scripts/
+    seed.js                  demo data
+    expiry-sweep.js          one-shot sweep, run by the Kubernetes CronJob
+  Dockerfile                 multi-stage, non-root, dumb-init
+  docker-compose.yml         API + MongoDB + PostgreSQL
+deploy/
+  kind/                      local cluster config and add-on patches
+  k8s/                       namespace, config, Mongo StatefulSet, API, Ingress, CronJob
+terraform/                   kind cluster + ingress-nginx + metrics-server, remote state
+  bootstrap/                 MinIO, the S3-compatible state backend
+docs/
+  persistence-postgres-vs-mongo.md
 mobile/
   App.js                     screens: auth, courts, booking, my bookings
   api.js                     typed API client
@@ -267,10 +386,20 @@ Built as a portfolio project. Deliberately out of scope:
 - **No real card entry in the mobile app.** Shares are settled through the provider's test flow
   rather than a native payment sheet.
 - **No dispute or admin console.**
-- **The expiry sweep is an in-process interval.** Fine for one instance; a real deployment would
-  use a dedicated scheduler so restarts don't skip a window.
 - **No rate limiting or email delivery.** Participants are matched by existing account, not invited
   by email.
+- **PostgreSQL covers the write path only.** `bookingController.listMine` and `getOne` still query
+  Mongoose directly with `populate`, so those two read endpoints do not work under
+  `DB_ENGINE=postgres`. Porting them needs JOINs plus a decision about preserving the nested
+  response shape the mobile client expects.
+- **No migration tooling.** `schema.sql` is applied wholesale; there is no versioned history, and
+  no data migration path between engines.
+- **Secrets in `deploy/k8s` are plain `stringData` in a committed file.** Kubernetes Secrets are
+  base64, not encrypted. Acceptable for a local kind cluster and nothing else — a real deployment
+  needs Sealed Secrets, External Secrets, or SOPS.
+- **The concurrency tests sample interleavings rather than enumerating them.** Details and the
+  measured evidence are in
+  [docs/persistence-postgres-vs-mongo.md](docs/persistence-postgres-vs-mongo.md).
 
 ---
 

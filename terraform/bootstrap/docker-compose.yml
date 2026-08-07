@@ -1,0 +1,51 @@
+# Remote state backend.
+#
+# Terraform state must live somewhere durable and shared - a local terraform.tfstate
+# does not survive a lost laptop and cannot be used by two people or by CI.
+# In a cloud account this would be an S3 bucket (or Azure Blob / GCS).
+#
+# MinIO is S3-compatible and runs locally, so the *pattern* is exercised
+# honestly - a real S3 backend block, real credentials, real state locking -
+# without needing a cloud account or spending anything. Swapping this for AWS
+# S3 means changing the endpoint and credentials in backend.tf, nothing else.
+#
+#   docker compose -f terraform/bootstrap/docker-compose.yml up -d
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: courtsplit-tfstate
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: courtsplit
+      MINIO_ROOT_PASSWORD: courtsplit-dev-secret
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - tfstate:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # One-shot: creates the state bucket and enables versioning, then exits.
+  # Versioning matters for state - it is the difference between "recover the
+  # previous state file" and "reconstruct it by hand" after a bad apply.
+  createbucket:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 courtsplit courtsplit-dev-secret &&
+      mc mb --ignore-existing local/courtsplit-tfstate &&
+      mc version enable local/courtsplit-tfstate &&
+      echo 'state bucket ready'
+      "
+    restart: "no"
+
+volumes:
+  tfstate:
