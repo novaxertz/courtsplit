@@ -1,0 +1,21 @@
+# PostgreSQL for the relational adapter and its test runs.
+#
+# Port 5433 on the host deliberately, so a local PostgreSQL already listening on
+# 5432 is not shadowed. The container still uses 5432 internally.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: courtsplit-pg
+    environment:
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: courtsplit
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d courtsplit"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No named volume: this database is for development and tests, and the
+    # schema is reapplied on every test start. Persisting it would only make
+    # stale state harder to notice.

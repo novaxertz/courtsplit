@@ -1,17 +1,7 @@
 const mongoose = require('mongoose');
 
-const BOOKING_STATUS = {
-  PENDING_PAYMENT: 'PENDING_PAYMENT',
-  CONFIRMED: 'CONFIRMED',
-  EXPIRED: 'EXPIRED',
-  CANCELLED: 'CANCELLED'
-};
-
-const SHARE_STATUS = {
-  PENDING: 'pending',
-  PAID: 'paid',
-  REFUNDED: 'refunded'
-};
+// Shared with the service layer and the PostgreSQL adapter.
+const { BOOKING_STATUS, SHARE_STATUS } = require('../domain/status');
 
 /** One participant's portion of a booking. */
 const shareSchema = new mongoose.Schema(
