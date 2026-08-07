@@ -1,0 +1,17 @@
+# Pin the ingress controller to the node that has the host port mappings.
+#
+# The ingress-nginx kind manifest binds hostPort 80/443 but, as of
+# controller-v1.15.1, its nodeSelector is only `kubernetes.io/os: linux` - it no
+# longer selects `ingress-ready=true`. On a multi-node kind cluster the
+# controller is therefore free to land on a worker, which has no
+# extraPortMappings, and http://localhost:8080 answers with an empty reply
+# because nothing is listening on the mapped node's port 80.
+#
+# This patch restores the pin so the controller runs on the control-plane node,
+# which is the one the kind config maps 80 -> 8080 and 443 -> 8443 on.
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+        ingress-ready: "true"

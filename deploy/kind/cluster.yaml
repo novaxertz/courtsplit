@@ -1,0 +1,31 @@
+# kind cluster for CourtSplit.
+#
+#   kind create cluster --config deploy/kind/cluster.yaml
+#
+# Two nodes rather than one, so Deployment replicas actually land on different
+# machines and `kubectl get pods -o wide` shows real scheduling instead of
+# everything piling onto a single node.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: courtsplit
+
+nodes:
+  - role: control-plane
+    # ingress-nginx's kind manifest selects nodes carrying this label.
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    # kind nodes are containers, so cluster ports are not reachable from the
+    # host unless mapped here. This is what makes http://localhost work once
+    # the ingress controller is running.
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+  - role: worker

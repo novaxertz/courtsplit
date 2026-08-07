@@ -1,0 +1,86 @@
+# MongoDB as a StatefulSet.
+#
+# A Deployment would be wrong here. Deployments assume interchangeable,
+# stateless replicas; a database needs stable identity and its own durable
+# volume that survives rescheduling. StatefulSet gives both: a predictable pod
+# name (courtsplit-mongo-0) and a PVC bound to that ordinal.
+#
+# Single replica deliberately - this is a dev cluster. A real replica set needs
+# initiation and per-member configuration, which is exactly the work an
+# operator or a managed service should be doing instead.
+apiVersion: v1
+kind: Service
+metadata:
+  name: courtsplit-mongo
+  namespace: courtsplit
+  labels:
+    app: courtsplit-mongo
+spec:
+  # Headless (clusterIP: None): DNS resolves straight to pod IPs rather than to
+  # a load-balanced virtual IP. This is what StatefulSets expect, and it is how
+  # a client would later address individual replica-set members by name.
+  clusterIP: None
+  selector:
+    app: courtsplit-mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: courtsplit-mongo
+  namespace: courtsplit
+spec:
+  serviceName: courtsplit-mongo
+  replicas: 1
+  selector:
+    matchLabels:
+      app: courtsplit-mongo
+  template:
+    metadata:
+      labels:
+        app: courtsplit-mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          ports:
+            - name: mongo
+              containerPort: 27017
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # No CPU limit on purpose. CPU is compressible - exceeding a
+              # request means throttling, not death - and a hard limit on a
+              # database mostly buys latency spikes. Memory IS capped, because
+              # memory is incompressible: without a limit a runaway pod can
+              # evict its neighbours.
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
