@@ -314,4 +314,20 @@ const webhookEvents = {
   }
 };
 
-module.exports = { engine: 'postgres', courts, users, bookings, webhookEvents };
+const connection = {
+  async connect() {
+    // The pool connects lazily; force one connection now so a bad URL or an
+    // unreachable server fails at startup rather than on the first request.
+    await query('SELECT 1');
+  },
+
+  async disconnect() {
+    await require('./pool').end();
+  },
+
+  async ping() {
+    await query('SELECT 1');
+  }
+};
+
+module.exports = { engine: 'postgres', connection, courts, users, bookings, webhookEvents };

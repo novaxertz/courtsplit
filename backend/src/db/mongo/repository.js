@@ -219,4 +219,27 @@ const webhookEvents = {
   }
 };
 
-module.exports = { engine: 'mongo', courts, users, bookings, webhookEvents };
+const connection = {
+  async connect() {
+    const config = require('../../config/env');
+    mongoose.set('strictQuery', true);
+    await mongoose.connect(config.mongoUri);
+  },
+
+  async disconnect() {
+    await mongoose.connection.close();
+  },
+
+  /**
+   * Round-trips a command to the server.
+   *
+   * Deliberately not `readyState`, which only reports what the driver believes
+   * about its own socket. A readiness probe has to answer "can I serve a
+   * request right now", and only an actual command proves that.
+   */
+  async ping() {
+    await mongoose.connection.db.admin().ping();
+  }
+};
+
+module.exports = { engine: 'mongo', connection, courts, users, bookings, webhookEvents };
