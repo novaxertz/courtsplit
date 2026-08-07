@@ -22,10 +22,39 @@ const LIVE_STATUSES = [BOOKING_STATUS.PENDING_PAYMENT, BOOKING_STATUS.CONFIRMED]
 
 const id = (value) => (value === null || value === undefined ? null : value.toString());
 
+/**
+ * Reads the id out of a reference that may or may not be populated.
+ *
+ * An unpopulated ref is an ObjectId, whose toString() is the hex id. A
+ * populated one is a full document, whose toString() is not - so calling id()
+ * blindly on a populated field yields garbage. Every ref goes through here.
+ */
+const refId = (value) => {
+  if (value === null || value === undefined) return null;
+  return value._id !== undefined ? value._id.toString() : value.toString();
+};
+
+/** Present only when the ref was populated; otherwise the caller has the id. */
+const courtSummary = (doc) =>
+  doc && doc.name !== undefined
+    ? {
+        id: id(doc._id),
+        name: doc.name,
+        venueName: doc.venueName,
+        location: doc.location,
+        sport: doc.sport
+      }
+    : undefined;
+
+const userSummary = (doc) =>
+  doc && doc.email !== undefined
+    ? { id: id(doc._id), name: doc.name, email: doc.email }
+    : undefined;
+
 function toShare(doc) {
   return {
     id: id(doc._id),
-    userId: id(doc.user),
+    userId: refId(doc.user),
     email: doc.email,
     amount: doc.amount,
     status: doc.status,
@@ -38,10 +67,14 @@ function toShare(doc) {
 
 function toBooking(doc) {
   if (!doc) return null;
+  const court = courtSummary(doc.court);
+  const organiser = userSummary(doc.organiser);
   return {
     id: id(doc._id),
-    courtId: id(doc.court),
-    organiserId: id(doc.organiser),
+    courtId: refId(doc.court),
+    organiserId: refId(doc.organiser),
+    ...(court ? { court } : {}),
+    ...(organiser ? { organiser } : {}),
     slotStart: doc.slotStart,
     slotEnd: doc.slotEnd,
     totalAmount: doc.totalAmount,
@@ -107,6 +140,26 @@ const bookings = {
   async findById(bookingId) {
     if (!mongoose.isValidObjectId(bookingId)) return null;
     return toBooking(await Booking.findById(bookingId));
+  },
+
+  /** Bookings where the user is the organiser or holds a share, court attached. */
+  async listForUser(userId) {
+    if (!mongoose.isValidObjectId(userId)) return [];
+    const docs = await Booking.find({
+      $or: [{ organiser: userId }, { 'shares.user': userId }]
+    })
+      .populate('court', 'name venueName location sport')
+      .sort({ slotStart: 1 });
+    return docs.map(toBooking);
+  },
+
+  /** Single booking with court and organiser attached, for the detail view. */
+  async findByIdWithDetails(bookingId) {
+    if (!mongoose.isValidObjectId(bookingId)) return null;
+    const doc = await Booking.findById(bookingId)
+      .populate('court', 'name venueName location sport')
+      .populate('organiser', 'name email');
+    return toBooking(doc);
   },
 
   async attachPaymentRefs(bookingId, refs) {

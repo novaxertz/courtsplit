@@ -158,6 +158,100 @@ const bookings = {
     return loadBooking({ query }, bookingId);
   },
 
+  /**
+   * Bookings where the user is the organiser or holds a share, court attached.
+   *
+   * Two queries regardless of result size, not one per booking. The obvious
+   * implementation - fetch bookings, then loop fetching each one's shares - is
+   * the N+1 pattern, and it degrades linearly with a user's booking count.
+   * Instead the second query pulls every relevant share with `= ANY($1)` and
+   * groups them in memory.
+   *
+   * The participant test is EXISTS rather than a JOIN: a join against
+   * booking_shares would emit one row per share and need a DISTINCT to undo
+   * the duplication. EXISTS short-circuits on the first matching share and
+   * leaves the row count alone.
+   */
+  async listForUser(userId) {
+    if (!numericId(userId)) return [];
+
+    const { rows: bookingRows } = await query(
+      `SELECT ${BOOKING_COLUMNS.split(',').map((c) => `b.${c.trim()}`).join(', ')},
+              c.name AS court_name, c.venue_name AS court_venue_name,
+              c.location AS court_location, c.sport AS court_sport
+         FROM bookings b
+         JOIN courts c ON c.id = b.court_id
+        WHERE b.organiser_id = $1
+           OR EXISTS (SELECT 1 FROM booking_shares s
+                       WHERE s.booking_id = b.id AND s.user_id = $1)
+        ORDER BY b.slot_start ASC`,
+      [userId]
+    );
+    if (bookingRows.length === 0) return [];
+
+    const { rows: shareRows } = await query(
+      `SELECT booking_id, id, user_id, email, amount, status, payment_ref,
+              paid_at, refunded_at, refund_amount
+         FROM booking_shares
+        WHERE booking_id = ANY($1)
+        ORDER BY id`,
+      [bookingRows.map((r) => r.id)]
+    );
+
+    const sharesByBooking = new Map();
+    for (const row of shareRows) {
+      const key = String(row.booking_id);
+      if (!sharesByBooking.has(key)) sharesByBooking.set(key, []);
+      sharesByBooking.get(key).push(row);
+    }
+
+    return bookingRows.map((row) => ({
+      ...toBooking(row, sharesByBooking.get(String(row.id)) || []),
+      court: {
+        id: String(row.court_id),
+        name: row.court_name,
+        venueName: row.court_venue_name,
+        location: row.court_location,
+        sport: row.court_sport
+      }
+    }));
+  },
+
+  /** Single booking with court and organiser attached, for the detail view. */
+  async findByIdWithDetails(bookingId) {
+    if (!numericId(bookingId)) return null;
+
+    const { rows } = await query(
+      `SELECT ${BOOKING_COLUMNS.split(',').map((c) => `b.${c.trim()}`).join(', ')},
+              c.name AS court_name, c.venue_name AS court_venue_name,
+              c.location AS court_location, c.sport AS court_sport,
+              u.name AS organiser_name, u.email AS organiser_email
+         FROM bookings b
+         JOIN courts c ON c.id = b.court_id
+         JOIN users  u ON u.id = b.organiser_id
+        WHERE b.id = $1`,
+      [bookingId]
+    );
+    if (!rows[0]) return null;
+
+    const row = rows[0];
+    return {
+      ...toBooking(row, await loadShares({ query }, bookingId)),
+      court: {
+        id: String(row.court_id),
+        name: row.court_name,
+        venueName: row.court_venue_name,
+        location: row.court_location,
+        sport: row.court_sport
+      },
+      organiser: {
+        id: String(row.organiser_id),
+        name: row.organiser_name,
+        email: row.organiser_email
+      }
+    };
+  },
+
   async attachPaymentRefs(bookingId, refs) {
     return withTransaction(async (client) => {
       for (const { shareId, paymentRef } of refs) {
