@@ -388,10 +388,9 @@ Built as a portfolio project. Deliberately out of scope:
 - **No dispute or admin console.**
 - **No rate limiting or email delivery.** Participants are matched by existing account, not invited
   by email.
-- **PostgreSQL covers the write path only.** `bookingController.listMine` and `getOne` still query
-  Mongoose directly with `populate`, so those two read endpoints do not work under
-  `DB_ENGINE=postgres`. Porting them needs JOINs plus a decision about preserving the nested
-  response shape the mobile client expects.
+- **No pagination on `GET /bookings`.** `listForUser` returns every booking a user is involved in.
+  Two queries regardless of result size, so it does not degrade per-row, but an unbounded result
+  set is still the wrong shape for a real account.
 - **No migration tooling.** `schema.sql` is applied wholesale; there is no versioned history, and
   no data migration path between engines.
 - **Secrets in `deploy/k8s` are plain `stringData` in a committed file.** Kubernetes Secrets are
