@@ -31,12 +31,24 @@ function confirmPaymentIntent(id) {
   return Promise.resolve(intent);
 }
 
+// Shape of an id issued by createPaymentIntent in ANY process.
+const INTENT_ID = /^mock_pi_[0-9a-f]{16}$/;
+
+/**
+ * Intents live in this process's memory, but refunds are often issued from a
+ * different process: the expiry CronJob, or another API replica. Stripe would
+ * know the intent regardless, so a well-formed id this process has not seen is
+ * treated as issued elsewhere. Malformed ids are still rejected.
+ */
 function refund({ paymentRef, amount }) {
   const intent = intents.get(paymentRef);
-  if (!intent) {
+  if (!intent && !INTENT_ID.test(paymentRef || '')) {
     return Promise.reject(new Error(`Unknown payment intent: ${paymentRef}`));
   }
-  intent.status = 'refunded';
+  if (!intent && amount === undefined) {
+    return Promise.reject(new Error(`Refund amount required for foreign intent: ${paymentRef}`));
+  }
+  if (intent) intent.status = 'refunded';
   return Promise.resolve({
     id: `mock_re_${crypto.randomBytes(6).toString('hex')}`,
     paymentRef,

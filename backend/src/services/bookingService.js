@@ -158,8 +158,13 @@ async function refundPaidShares(booking, percent = 100) {
   const paid = booking.shares.filter((s) => s.status === SHARE_STATUS.PAID);
   if (!paid.length) return booking;
 
+  /**
+   * `allSettled`, not `all`. With `all`, one failed refund rejects immediately
+   * and the refunds that DID go through are never recorded, so the retry would
+   * send them again. Record every success first, then report the failures.
+   */
   const refunds = [];
-  await Promise.all(
+  const results = await Promise.allSettled(
     paid.map(async (share) => {
       const amount = percentageOf(share.amount, percent);
       if (amount <= 0) return;
@@ -172,29 +177,83 @@ async function refundPaidShares(booking, percent = 100) {
     })
   );
 
-  if (!refunds.length) return booking;
-  return (await db.bookings.applyRefunds(booking.id, refunds)) || booking;
+  const settled = refunds.length
+    ? (await db.bookings.applyRefunds(booking.id, refunds)) || booking
+    : booking;
+
+  const failed = results.filter((r) => r.status === 'rejected');
+  if (failed.length) {
+    const err = new Error(
+      `${failed.length} refund(s) failed for booking ${booking.id}: ${failed[0].reason.message}`
+    );
+    err.booking = settled;
+    throw err;
+  }
+  return settled;
 }
+
+// How long an expired booking must sit with a paid share before a sweep treats
+// the refund as failed and retries it, rather than as still in progress on
+// whichever worker claimed it.
+const REFUND_RETRY_GRACE_MS = 5 * 60 * 1000;
 
 /**
  * Expires bookings that were not fully funded before their deadline and
  * refunds whoever had already paid. The claim is a conditional transition, so
  * this is safe to run on a schedule and on more than one instance at once -
  * losers of the race simply skip the booking.
+ *
+ * Claiming happens before refunding, so a refund can fail on a booking that is
+ * already EXPIRED. Such a booking is no longer a PENDING_PAYMENT candidate, so
+ * without the second pass below the money would stay held forever. Each run
+ * therefore also retries expired bookings that still hold a paid share.
+ *
+ * A failure on one booking does not stop the others. If any failed, the sweep
+ * throws after finishing the rest, so a CronJob run exits non-zero and shows up
+ * as failed instead of looking healthy.
  */
 async function expireUnfundedBookings(now = new Date()) {
-  const candidateIds = await db.bookings.findExpiryCandidateIds(now);
-
   const expired = [];
+  const failures = [];
+
+  const settle = async (booking, message) => {
+    try {
+      expired.push(await refundPaidShares(booking, 100));
+      logger.info(message, { bookingId: booking.id });
+    } catch (err) {
+      failures.push({ bookingId: booking.id, message: err.message });
+      logger.error('Refund failed; booking will be retried by a later sweep', {
+        bookingId: booking.id,
+        message: err.message
+      });
+    }
+  };
+
+  const candidateIds = await db.bookings.findExpiryCandidateIds(now);
   for (const candidateId of candidateIds) {
     // eslint-disable-next-line no-await-in-loop
     const claimed = await db.bookings.claimExpiredIfPending(candidateId, now);
     if (!claimed) continue; // another worker got there first
 
     // eslint-disable-next-line no-await-in-loop
-    const settled = await refundPaidShares(claimed, 100);
-    expired.push(settled);
-    logger.info('Booking expired and refunded', { bookingId: claimed.id });
+    await settle(claimed, 'Booking expired and refunded');
+  }
+
+  const strandedIds = await db.bookings.findStrandedRefundIds(
+    new Date(now.getTime() - REFUND_RETRY_GRACE_MS)
+  );
+  for (const strandedId of strandedIds) {
+    // eslint-disable-next-line no-await-in-loop
+    const booking = await db.bookings.findById(strandedId);
+    // eslint-disable-next-line no-await-in-loop
+    if (booking) await settle(booking, 'Retried refund for expired booking');
+  }
+
+  if (failures.length) {
+    const err = new Error(`Expiry sweep: ${failures.length} booking(s) could not be refunded`);
+    err.failures = failures;
+    err.expired = expired;
+    throw err;
   }
   return expired;
 }

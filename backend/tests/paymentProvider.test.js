@@ -38,6 +38,12 @@ test('unknown intents are rejected rather than silently ignored', async () => {
   await assert.rejects(() => mock.refund({ paymentRef: 'mock_pi_missing' }));
 });
 
+test('refunds an intent issued by another process, e.g. the expiry CronJob', async () => {
+  const refund = await mock.refund({ paymentRef: 'mock_pi_0123456789abcdef', amount: 1500 });
+  assert.strictEqual(refund.amount, 1500);
+  assert.strictEqual(refund.status, 'succeeded');
+});
+
 test('constructEvent parses a provider payload', () => {
   const payload = Buffer.from(
     JSON.stringify({ id: 'evt_1', type: 'payment_intent.succeeded', data: { object: {} } })

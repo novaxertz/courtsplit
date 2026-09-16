@@ -210,6 +210,23 @@ const bookings = {
     return docs.map((d) => id(d._id));
   },
 
+  /**
+   * Expired bookings still holding a paid share: the refund failed after the
+   * booking was claimed. `expiredBefore` keeps a sweep off bookings another
+   * worker has only just claimed and may still be refunding.
+   */
+  async findStrandedRefundIds(expiredBefore) {
+    const docs = await Booking.find(
+      {
+        status: BOOKING_STATUS.EXPIRED,
+        expiredAt: { $lte: expiredBefore },
+        'shares.status': SHARE_STATUS.PAID
+      },
+      { _id: 1 }
+    );
+    return docs.map((d) => id(d._id));
+  },
+
   /** Atomically claims a booking for expiry. Null means another worker won. */
   async claimExpiredIfPending(bookingId, at) {
     const doc = await Booking.findOneAndUpdate(

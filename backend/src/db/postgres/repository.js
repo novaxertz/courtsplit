@@ -328,6 +328,16 @@ const bookings = {
     return rows.map((r) => String(r.id));
   },
 
+  async findStrandedRefundIds(expiredBefore) {
+    const { rows } = await query(
+      `SELECT DISTINCT b.id FROM bookings b
+         JOIN booking_shares s ON s.booking_id = b.id
+        WHERE b.status = 'EXPIRED' AND b.expired_at <= $1 AND s.status = 'paid'`,
+      [expiredBefore]
+    );
+    return rows.map((r) => String(r.id));
+  },
+
   async claimExpiredIfPending(bookingId, at) {
     return withTransaction(async (client) => {
       const { rows } = await client.query(
