@@ -58,7 +58,12 @@ const availability = asyncHandler(async (req, res) => {
     court: court._id,
     status: { $in: [BOOKING_STATUS.PENDING_PAYMENT, BOOKING_STATUS.CONFIRMED] },
     slotStart: { $gte: from, $lte: to }
-  }).select('slotStart slotEnd status');
+  })
+    .select('slotStart slotEnd status')
+    // lean(): plain objects. As hydrated documents, toJSON ran the Booking
+    // virtuals (paidAmount, isFullyFunded), which read `shares` - excluded by
+    // the select - and threw, so any court with a live booking returned 500.
+    .lean();
 
   res.json({ court: court.id, from, to, unavailable: taken });
 });
