@@ -10,7 +10,7 @@ async function start() {
   /**
    * The in-process sweep is now opt-out.
    *
-   * Under Kubernetes a CronJob owns this (deploy/k8s/40-ingress.yaml) and the
+   * Under Kubernetes a CronJob owns this (deploy/k8s/50-cronjob.yaml) and the
    * API sets EXPIRY_SWEEP_IN_PROCESS=false, so replicas do not each run their
    * own scheduler. It stays on by default for `npm run dev` and plain
    * `docker run`, where there is nothing else to trigger it.
