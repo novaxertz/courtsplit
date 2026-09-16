@@ -19,9 +19,17 @@ if (!['mongo', 'postgres'].includes(engine)) {
 
 console.log(`\n=== test suite on ${engine} ===\n`);
 
+/**
+ * node --test runs test files in parallel processes. On MongoDB each file
+ * starts its own in-memory server, but on PostgreSQL every file shares one
+ * database and truncates it between tests, so parallel files wipe each other's
+ * fixtures mid-test ("Court not found"). Files run one at a time there.
+ */
+const concurrency = engine === 'postgres' ? ['--test-concurrency=1'] : [];
+
 const child = spawn(
   process.execPath,
-  ['--test', 'tests/**/*.test.js'],
+  ['--test', ...concurrency, 'tests/**/*.test.js'],
   { stdio: 'inherit', env: { ...process.env, DB_ENGINE: engine } }
 );
 
